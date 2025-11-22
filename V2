@@ -1,0 +1,167 @@
+# Student Simulator with Random Events
+import pygame
+import random
+import json
+import sys
+
+pygame.init()
+WIDTH, HEIGHT = 900, 600
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Student Simulator")
+clock = pygame.time.Clock()
+
+FONT = pygame.font.SysFont("arial", 22)
+BIG = pygame.font.SysFont("arial", 30)
+
+# --------------------- PLAYER ----------------------
+player = {
+    "energy": 100,
+    "knowledge": 20,
+    "social": 50,
+    "money": 20,
+    "day": 1
+}
+
+# ------------------ RANDOM EVENTS -------------------
+action_events = [
+    {
+        "name": "Стипендия!",
+        "action": "study",
+        "chance": 0.10,
+        "effect": {"money": +30},
+        "message": "Вы нашли грант и получили +30 денег!"
+    },
+    {
+        "name": "Ссора с начальником",
+        "action": "work",
+        "chance": 0.05,
+        "effect": {"money": -10, "social": -5},
+        "message": "Поссорились с начальником: -10 денег, -5 социализации"
+    }
+]
+
+daily_events = [
+    {
+        "name": "Плохой сон",
+        "chance": 0.07,
+        "effect": {"energy": -10},
+        "message": "Вы плохо спали: -10 энергии"
+    },
+    {
+        "name": "Отличная погода",
+        "chance": 0.05,
+        "effect": {"social": +5},
+        "message": "Погода прекрасная! +5 социализации"
+    }
+]
+
+# --------------- BASIC ACTIONS ----------------
+actions = {
+    "study": lambda p: {"energy": -15, "knowledge": +10},
+    "sleep": lambda p: {"energy": +30},
+    "work": lambda p: {"energy": -20, "money": +25},
+    "rest": lambda p: {"energy": +10, "social": +10}
+}
+
+# ------------- APPLY EFFECT ----------------
+def apply_effect(player, effect):
+    for k, v in effect.items():
+        player[k] += v
+    player["energy"] = max(0, min(100, player["energy"]))
+    player["social"] = max(0, min(100, player["social"]))
+
+# ---------- PROCESS RANDOM EVENT -----------
+def try_random_event(event_list, action_name=None):
+    for ev in event_list:
+        if action_name and ev.get("action") != action_name:
+            continue
+        if random.random() < ev["chance"]:
+            apply_effect(player, ev["effect"])
+            return ev["message"]
+    return None
+
+# ---------------- UI BUTTON ----------------
+class Button:
+    def __init__(self, x, y, w, h, text, action):
+        self.rect = pygame.Rect(x, y, w, h)
+        self.text = text
+        self.action = action
+    def draw(self):
+        pygame.draw.rect(screen, (220,220,220), self.rect)
+        pygame.draw.rect(screen, (0,0,0), self.rect, 2)
+        screen.blit(FONT.render(self.text, True, (0,0,0)), (self.rect.x+10, self.rect.y+10))
+    def click(self):
+        if self.action:
+            return self.action()
+        return None
+
+
+# ---------- ACTION EXECUTOR -----------
+message = ""
+
+def do_action(name):
+    global message
+    base = actions[name](player)
+    apply_effect(player, base)
+
+    event_msg = try_random_event(action_events, name)
+    if event_msg:
+        message = event_msg
+    else:
+        message = f"Выполнено действие: {name}"
+
+# ---------- NEW DAY EVENT ----------
+def new_day():
+    global message
+    player["day"] += 1
+    event_msg = try_random_event(daily_events)
+    if event_msg:
+        message = event_msg
+    else:
+        message = "Новый день начался!"
+
+# ---------------- BUTTONS ----------------
+buttons = [
+    Button(650, 50, 200, 50, "Учиться", lambda: do_action("study")),
+    Button(650, 120, 200, 50, "Спать", lambda: do_action("sleep")),
+    Button(650, 190, 200, 50, "Работать", lambda: do_action("work")),
+    Button(650, 260, 200, 50, "Отдыхать", lambda: do_action("rest")),
+    Button(650, 330, 200, 50, "Следующий день", new_day)
+]
+
+# ---------------- MAIN LOOP ----------------
+running = True
+while running:
+    for e in pygame.event.get():
+        if e.type == pygame.QUIT:
+            running = False
+        if e.type == pygame.MOUSEBUTTONDOWN:
+            for b in buttons:
+                if b.rect.collidepoint(e.pos):
+                    b.click()
+
+    screen.fill((180,200,220))
+
+    # Stats
+    stats = [
+        f"Day: {player['day']}",
+        f"Energy: {player['energy']}",
+        f"Knowledge: {player['knowledge']}",
+        f"Social: {player['social']}",
+        f"Money: {player['money']}"
+    ]
+    for i, t in enumerate(stats):
+        screen.blit(BIG.render(t, True, (0,0,0)), (40, 40 + i*40))
+
+    # Message
+    screen.blit(FONT.render(message, True, (0,0,0)), (40, 350))
+
+    # Buttons
+    for b in buttons:
+        b.draw()
+
+    pygame.display.update()
+    clock.tick(60)
+
+pygame.quit()
+sys.exit()
