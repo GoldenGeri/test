@@ -1,0 +1,429 @@
+"""
+Student Simulator — single-file Python game (pygame)
+Features:
+- Procedurally generated visuals (rectangles, icons, simple avatar)
+- Simple mechanics: stats (Energy, Knowledge, Social, Money), actions, day cycle
+- Simple sounds generated procedurally (sine tones) using numpy + pygame.sndarray (fallback when unavailable)
+- Save/load state to JSON
+- Configurable difficulty and speed
+
+Run: python student_simulator.py
+Requires: Python 3.8+, pygame. numpy recommended (for sound generation) but optional.
+Install: pip install pygame numpy
+
+You can iterate on this file, send it to Gemini, request changes, or ask me to modify any part.
+"""
+
+import sys
+import json
+import math
+import random
+import time
+from pathlib import Path
+
+# try to import pygame, otherwise show helpful message
+try:
+    import pygame
+    from pygame import gfxdraw
+except Exception as e:
+    print("This game requires pygame. Install it with: pip install pygame")
+    raise
+
+# optional numpy for sound generation
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except Exception:
+    HAS_NUMPY = False
+
+SAVE_FILE = Path("student_save.json")
+
+# --- Game configuration ---
+WIDTH, HEIGHT = 900, 620
+FPS = 60
+DAY_LENGTH_SECONDS = 60.0  # full day cycle in real seconds
+
+# Colors
+WHITE = (245, 245, 245)
+BLACK = (20, 20, 20)
+BG_COLOR = (30, 36, 50)
+PANEL_COLOR = (40, 45, 60)
+
+# Stat ranges
+STAT_MIN = 0
+STAT_MAX = 100
+
+# Utility functions
+
+def clamp(x, a, b):
+    return max(a, min(b, x))
+
+
+# --- Sound generation ---
+class SoundManager:
+    def __init__(self):
+        pygame.mixer.pre_init(44100, -16, 1, 512)
+        pygame.mixer.init()
+        self.sounds = {}
+
+    def make_tone(self, freq=440, length_ms=250, volume=0.2):
+        # Create a short tone. If numpy is available, generate waveform and convert to Sound.
+        if not HAS_NUMPY:
+            # fallback: try pygame beep using set_volume silence if not supported
+            arr = pygame.mixer.Sound(buffer=b"\x00" * 100)
+            return arr
+        sample_rate = 44100
+        t = np.linspace(0, length_ms / 1000.0, int(sample_rate * (length_ms / 1000.0)), endpoint=False)
+        wave = 0.5 * np.sin(2 * np.pi * freq * t)
+        # apply fade
+        fade = np.minimum(1, np.linspace(0, 1, wave.size) * 4)
+        wave = (wave * fade * volume * (2**15 - 1)).astype(np.int16)
+        snd = pygame.sndarray.make_sound(wave)
+        return snd
+
+    def get(self, name):
+        if name in self.sounds:
+            return self.sounds[name]
+        # generate simple tones per name
+        if name == 'click':
+            s = self.make_tone(880, 70, 0.15)
+        elif name == 'action':
+            s = self.make_tone(660, 140, 0.2)
+        elif name == 'alert':
+            s = self.make_tone(440, 300, 0.25)
+        else:
+            s = self.make_tone(523, 120, 0.12)
+        self.sounds[name] = s
+        return s
+
+
+# --- Game data models ---
+class Student:
+    def __init__(self, name="Alex", year=1):
+        self.name = name
+        self.year = year
+        self.energy = 70
+        self.knowledge = 30
+        self.social = 40
+        self.money = 50
+        self.day = 1
+        self.time_of_day = 8.0  # 0-24 hours
+
+    def to_dict(self):
+        return self.__dict__.copy()
+
+    @classmethod
+    def from_dict(cls, d):
+        s = cls(d.get('name', 'Alex'), d.get('year', 1))
+        s.energy = d.get('energy', 70)
+        s.knowledge = d.get('knowledge', 30)
+        s.social = d.get('social', 40)
+        s.money = d.get('money', 50)
+        s.day = d.get('day', 1)
+        s.time_of_day = d.get('time_of_day', 8.0)
+        return s
+
+
+# --- UI helpers ---
+class Button:
+    def __init__(self, rect, text, action=None):
+        self.rect = pygame.Rect(rect)
+        self.text = text
+        self.action = action
+        self.hover = False
+
+    def draw(self, surf, font):
+        color = (80, 120, 180) if self.hover else (70, 90, 130)
+        pygame.draw.rect(surf, color, self.rect, border_radius=8)
+        txt = font.render(self.text, True, WHITE)
+        surf.blit(txt, txt.get_rect(center=self.rect.center))
+
+    def handle_event(self, ev):
+        if ev.type == pygame.MOUSEMOTION:
+            self.hover = self.rect.collidepoint(ev.pos)
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            if self.rect.collidepoint(ev.pos):
+                if self.action:
+                    self.action()
+                return True
+        return False
+
+
+# --- The main game class ---
+class StudentSimGame:
+    def __init__(self):
+        pygame.init()
+        self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
+        pygame.display.set_caption("Student Simulator")
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.SysFont("Arial", 18)
+        self.bigfont = pygame.font.SysFont("Arial", 28, bold=True)
+        self.running = True
+        self.student = Student()
+        self.sound = SoundManager()
+        self.buttons = []
+        self.make_ui()
+        self.last_tick = time.time()
+        self.day_speed = 24.0 / DAY_LENGTH_SECONDS  # hours per second
+        self.message = None
+        self.message_ttl = 0
+
+    def make_ui(self):
+        pad = 12
+        w = 150
+        h = 42
+        x = WIDTH - w - pad
+        y = pad
+        actions = [
+            ("Study (2h)", lambda: self.do_action('study')),
+            ("Sleep (6h)", lambda: self.do_action('sleep')),
+            ("Work (4h)", lambda: self.do_action('work')),
+            ("Relax (1.5h)", lambda: self.do_action('relax')),
+            ("Class (3h)", lambda: self.do_action('class')),
+        ]
+        for i, (text, act) in enumerate(actions):
+            btn = Button((x, y + i * (h + 10), w, h), text, action=act)
+            self.buttons.append(btn)
+        # quick save/load
+        btn_save = Button((x, HEIGHT - h*2 - pad, w, h), "Save", action=self.save_game)
+        btn_load = Button((x, HEIGHT - h - pad, w, h), "Load", action=self.load_game)
+        self.buttons.append(btn_save)
+        self.buttons.append(btn_load)
+
+    def post_message(self, text, ttl=2.0):
+        self.message = text
+        self.message_ttl = ttl
+        self.sound.get('click').play()
+
+    def do_action(self, act_name):
+        # actions affect stats and time
+        if act_name == 'study':
+            hours = 2
+            self.student.knowledge += 6 + random.randint(0,3)
+            self.student.energy -= 12
+            self.student.social -= 4
+            self.student.money -= 2
+            self.sound.get('action').play()
+            self.post_message("Studied — knowledge +", 2.5)
+        elif act_name == 'sleep':
+            hours = 6
+            self.student.energy += 30
+            self.student.social -= 2
+            self.sound.get('action').play()
+            self.post_message("Slept — energy restored", 2.5)
+        elif act_name == 'work':
+            hours = 4
+            earned = 15 + random.randint(-3,8)
+            self.student.money += earned
+            self.student.energy -= 20
+            self.student.social -= 6
+            self.sound.get('action').play()
+            self.post_message(f"Worked — earned {earned} UAH", 2.5)
+        elif act_name == 'relax':
+            hours = 1.5
+            self.student.energy += 8
+            self.student.social += 10
+            self.student.knowledge -= 1
+            self.sound.get('action').play()
+            self.post_message("Relaxed — social +", 2.5)
+        elif act_name == 'class':
+            hours = 3
+            self.student.knowledge += 10 + random.randint(0,4)
+            self.student.energy -= 10
+            self.student.social += 2
+            self.sound.get('action').play()
+            self.post_message("Attended class — knowledge +", 2.5)
+        else:
+            return
+        # advance time
+        self.advance_time(hours)
+        # clamp stats
+        self.student.energy = clamp(self.student.energy, STAT_MIN, STAT_MAX)
+        self.student.knowledge = clamp(self.student.knowledge, STAT_MIN, STAT_MAX)
+        self.student.social = clamp(self.student.social, STAT_MIN, STAT_MAX)
+        self.student.money = clamp(self.student.money, STAT_MIN, STAT_MAX)
+
+    def advance_time(self, hours):
+        self.student.time_of_day += hours
+        if self.student.time_of_day >= 24:
+            days_passed = int(self.student.time_of_day // 24)
+            self.student.day += days_passed
+            self.student.time_of_day = self.student.time_of_day % 24
+            # small daily decay/benefit
+            self.student.energy -= 3 * days_passed
+            self.student.social -= 1 * days_passed
+
+    def save_game(self):
+        d = self.student.to_dict()
+        with open(SAVE_FILE, 'w', encoding='utf-8') as f:
+            json.dump(d, f, ensure_ascii=False, indent=2)
+        self.post_message("Game saved", 1.8)
+
+    def load_game(self):
+        if not SAVE_FILE.exists():
+            self.post_message("No save file found", 2.2)
+            self.sound.get('alert').play()
+            return
+        with open(SAVE_FILE, 'r', encoding='utf-8') as f:
+            d = json.load(f)
+        self.student = Student.from_dict(d)
+        self.post_message("Game loaded", 1.8)
+
+    def draw_avatar(self, surf, x, y, size=100):
+        # Procedural avatar: circle head, rectangles for hair, simple face
+        cx, cy = x + size//2, y + size//2
+        pygame.draw.circle(surf, (255, 224, 189), (cx, cy), size//2)
+        # hair
+        hair_color = (random.randint(60,90), random.randint(20,40), random.randint(10,30))
+        pygame.draw.ellipse(surf, hair_color, (cx - size//2, cy - size//2 - 10, size, size//2))
+        # eyes
+        eye_y = cy - size//8
+        pygame.draw.circle(surf, BLACK, (cx - size//6, eye_y), size//18)
+        pygame.draw.circle(surf, BLACK, (cx + size//6, eye_y), size//18)
+        # mouth based on energy
+        mouth_y = cy + size//8
+        energy = clamp(self.student.energy, 0, 100)
+        mouth_w = int((energy / 100.0) * (size//3))
+        pygame.draw.rect(surf, (180, 60, 80), (cx - mouth_w//2, mouth_y, mouth_w, max(3, size//25)), border_radius=6)
+
+    def draw_stats(self, surf):
+        # left panel
+        panel_w = 300
+        panel_h = HEIGHT - 20
+        panel = pygame.Rect(10, 10, panel_w, panel_h)
+        pygame.draw.rect(surf, PANEL_COLOR, panel, border_radius=10)
+        # header
+        title = self.bigfont.render(f"Day {self.student.day} — {self.student.name} (Year {self.student.year})", True, WHITE)
+        surf.blit(title, (20, 18))
+        # time
+        tod = int(self.student.time_of_day)
+        mins = int((self.student.time_of_day - tod) * 60)
+        time_txt = self.font.render(f"Time: {tod:02d}:{mins:02d}", True, WHITE)
+        surf.blit(time_txt, (20, 52))
+        # avatar
+        self.draw_avatar(surf, 30, 80, 110)
+        # bars
+        stat_y = 210
+        gap = 36
+        bars = [
+            ("Energy", self.student.energy),
+            ("Knowledge", self.student.knowledge),
+            ("Social", self.student.social),
+            ("Money", self.student.money),
+        ]
+        for i, (label, val) in enumerate(bars):
+            y = stat_y + i * gap
+            lbl = self.font.render(f"{label}", True, WHITE)
+            surf.blit(lbl, (30, y))
+            # bar background
+            bx, by, bw, bh = 140, y - 6, 140, 18
+            pygame.draw.rect(surf, (70,70,70), (bx, by, bw, bh), border_radius=6)
+            # filled
+            fw = int((val / 100.0) * bw)
+            pygame.draw.rect(surf, (120, 200, 120), (bx, by, fw, bh), border_radius=6)
+            # value text
+            vtxt = self.font.render(str(int(val)), True, WHITE)
+            surf.blit(vtxt, (bx + bw + 8, y))
+
+    def draw_world(self, surf):
+        # main world area
+        area = pygame.Rect(330, 10, WIDTH - 340, HEIGHT - 20)
+        # gradient background depending on time
+        tod = self.student.time_of_day
+        # day color transition
+        if 6 <= tod < 18:
+            sky = (80, 150, 240)
+        else:
+            sky = (15, 25, 60)
+        pygame.draw.rect(surf, sky, area, border_radius=8)
+        # simple building procedurally
+        brect = pygame.Rect(area.x + 20, area.y + 40, area.width - 40, area.height - 100)
+        pygame.draw.rect(surf, (55, 60, 80), brect, border_radius=6)
+        # windows
+        cols = 6
+        rows = 4
+        wx = brect.x + 10
+        wy = brect.y + 10
+        ww = (brect.width - 20) // cols - 8
+        wh = (brect.height - 20) // rows - 8
+        for r in range(rows):
+            for c in range(cols):
+                x = wx + c * (ww + 8)
+                y = wy + r * (wh + 8)
+                # lit windows depend on random and time
+                lit = random.random() < 0.1 + (0.8 if (18 <= tod < 24 or 0 <= tod < 6) else 0.0)
+                color = (255, 230, 120) if lit else (20, 30, 40)
+                pygame.draw.rect(surf, color, (x, y, ww, wh), border_radius=4)
+        # small animated student icon moving
+        t = time.time()
+        xpos = area.x + 40 + (math.sin(t * 1.2) + 1) / 2 * (area.width - 160)
+        ypos = area.y + area.height - 60
+        pygame.draw.circle(surf, (200, 80, 80), (int(xpos), int(ypos)), 14)
+        pygame.draw.circle(surf, BLACK, (int(xpos)-6, int(ypos)-2), 3)
+
+    def draw_ui(self):
+        for b in self.buttons:
+            b.draw(self.screen, self.font)
+        # message
+        if self.message and self.message_ttl > 0:
+            txt = self.font.render(self.message, True, WHITE)
+            r = txt.get_rect(center=(WIDTH//2, HEIGHT - 30))
+            pygame.draw.rect(self.screen, (50,50,70), r.inflate(16,10), border_radius=8)
+            self.screen.blit(txt, r)
+
+    def update(self, dt):
+        # advance time slowly according to day_speed
+        self.student.time_of_day += dt * self.day_speed
+        if self.student.time_of_day >= 24:
+            days_passed = int(self.student.time_of_day // 24)
+            self.student.day += days_passed
+            self.student.time_of_day = self.student.time_of_day % 24
+        # message ttl
+        if self.message_ttl > 0:
+            self.message_ttl -= dt
+            if self.message_ttl <= 0:
+                self.message = None
+        # minor auto effects
+        # if very low energy cause knowledge to drop slowly
+        if self.student.energy < 10:
+            self.student.knowledge -= 0.02 * dt
+        # clamp
+        self.student.energy = clamp(self.student.energy, STAT_MIN, STAT_MAX)
+        self.student.knowledge = clamp(self.student.knowledge, STAT_MIN, STAT_MAX)
+        self.student.social = clamp(self.student.social, STAT_MIN, STAT_MAX)
+        self.student.money = clamp(self.student.money, STAT_MIN, STAT_MAX)
+
+    def handle_events(self):
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                self.running = False
+            if ev.type == pygame.KEYDOWN:
+                if ev.key == pygame.K_ESCAPE:
+                    self.running = False
+                if ev.key == pygame.K_F5:
+                    self.save_game()
+                if ev.key == pygame.K_F9:
+                    self.load_game()
+            for b in self.buttons:
+                b.handle_event(ev)
+
+    def run(self):
+        while self.running:
+            dt = self.clock.tick(FPS) / 1000.0
+            self.handle_events()
+            self.update(dt)
+            # draw
+            self.screen.fill(BG_COLOR)
+            self.draw_stats(self.screen)
+            self.draw_world(self.screen)
+            self.draw_ui()
+            # footer help
+            help_txt = self.font.render("Actions: click buttons on the right. F5 save, F9 load, Esc quit.", True, (180,180,190))
+            self.screen.blit(help_txt, (20, HEIGHT - 26))
+            pygame.display.flip()
+        pygame.quit()
+
+
+if __name__ == '__main__':
+    game = StudentSimGame()
+    game.run()
